@@ -145,5 +145,5 @@ app.post("/webhook", async (req, res) => {
 });
 
 /* --------------------------------- Server --------------------------------- */
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => console.log(`WA Gastos (Twilio) escuchando en :${PORT}`));
