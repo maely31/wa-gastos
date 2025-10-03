@@ -32,7 +32,7 @@ if (!adminInitialized) {
 const db = admin.firestore();
 
 /* ---------------------------- Configuración app --------------------------- */
-const DEFAULT_CURRENCY = (process.env.DEFAULT_CURRENCY || "PAB").toUpperCase();
+const DEFAULT_CURRENCY = (process.env.DEFAULT_CURRENCY || "USD").toUpperCase();
 
 // Twilio (Sandbox o número habilitado para WhatsApp)
 const TWILIO_SID = process.env.TWILIO_SID;          // ACxxxxxxxx
@@ -91,7 +91,7 @@ async function replyWhatsApp(to, body) {
 
 /* -------------------------------- Endpoints ------------------------------- */
 // Salud/diagnóstico
-app.get("/", (_req, res) => res.status(200).send("OK - wa-gastos-bot-twilio"));
+app.get("/", (_req, res) => res.status(200).send("OK - wa-gastos-bot"));
 app.post("/status", (req, res) => {
   // Si configuras Status Callback, Twilio pegará aquí eventos de entrega/lectura
   console.log("Status callback:", req.body);
