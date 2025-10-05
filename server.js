@@ -1,73 +1,63 @@
 import express from "express";
-import bodyParser from "body-parser";
 import admin from "firebase-admin";
-import twilio from "twilio";
 
+// ---------------- App ----------------
 const app = express();
+app.use(express.json()); // Meta envía JSON
 
-/**
- * Twilio Sandbox envía los mensajes como application/x-www-form-urlencoded.
- * bodyParser.urlencoded es necesario para leer req.body.Body, req.body.From, etc.
- */
-app.use(bodyParser.urlencoded({ extended: false }));
-
-/* ----------------------- Firebase Admin (Firestore) ----------------------- */
-// Opción recomendada en Render: pegar el JSON en GOOGLE_APPLICATION_CREDENTIALS_JSON
-let adminInitialized = false;
+// -------- Firebase Admin (igual que antes) --------
+let ok = false;
 if (process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON) {
   const creds = JSON.parse(process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON);
   admin.initializeApp({ credential: admin.credential.cert(creds) });
-  adminInitialized = true;
+  ok = true;
 } else if (process.env.GOOGLE_APPLICATION_CREDENTIALS) {
-  // Opción local: apunta a la ruta del archivo .json
   admin.initializeApp({ credential: admin.credential.applicationDefault() });
-  adminInitialized = true;
+  ok = true;
 }
-if (!adminInitialized) {
-  throw new Error(
-    "No hay credenciales de Firebase. Define GOOGLE_APPLICATION_CREDENTIALS_JSON (contenido) o GOOGLE_APPLICATION_CREDENTIALS (ruta)."
-  );
-}
-
+if (!ok) throw new Error("Faltan credenciales de Firebase.");
 const db = admin.firestore();
 
-/* ---------------------------- Configuración app --------------------------- */
+// ------------- Config Meta -------------
 const DEFAULT_CURRENCY = (process.env.DEFAULT_CURRENCY || "USD").toUpperCase();
+const WA_TOKEN = process.env.WHATSAPP_TOKEN;
+const PHONE_NUMBER_ID = process.env.WHATSAPP_PHONE_NUMBER_ID;
+const VERIFY_TOKEN = process.env.WHATSAPP_VERIFY_TOKEN;
 
-// Twilio (Sandbox o número habilitado para WhatsApp)
-const TWILIO_SID = process.env.TWILIO_SID;          // ACxxxxxxxx
-const TWILIO_AUTH = process.env.TWILIO_AUTH;        // token
-const TWILIO_NUMBER = process.env.TWILIO_NUMBER;    // ej: +14155238886 (sandbox)
-if (!TWILIO_SID || !TWILIO_AUTH || !TWILIO_NUMBER) {
-  console.warn("⚠️ Faltan variables de Twilio (TWILIO_SID/TWILIO_AUTH/TWILIO_NUMBER).");
+async function sendWhatsAppText(toWaId, message) {
+  const url = `https://graph.facebook.com/v21.0/${PHONE_NUMBER_ID}/messages`;
+  const body = {
+    messaging_product: "whatsapp",
+    to: toWaId,                // número destino E164 sin 'whatsapp:' (ej: "5076...")
+    type: "text",
+    text: { body: message }
+  };
+  const res = await fetch(url, {
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${WA_TOKEN}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify(body)
+  });
+  if (!res.ok) {
+    const txt = await res.text();
+    console.error("Meta send error:", res.status, txt);
+  }
 }
-const client = twilio(TWILIO_SID, TWILIO_AUTH);
 
-/* --------------------------------- Helpers -------------------------------- */
+// -------- Helpers (los mismos que ya usas) --------
 function parseMessage(text) {
   const raw = (text || "").trim();
   if (!raw) return { raw, lugar: null, monto: null, moneda: DEFAULT_CURRENCY };
-
-  // Normaliza coma decimal y divide en tokens
   const normalized = raw.replace(",", ".").toLowerCase();
   const tokens = normalized.split(/\s+/);
-
-  let lugarTokens = [];
-  let monto = null;
-  let moneda = null;
-
+  let lugarTokens = [], monto = null, moneda = null;
   for (const t of tokens) {
-    if (monto === null && /^-?\d+(\.\d+)?$/.test(t)) {
-      monto = parseFloat(t);
-      continue;
-    }
-    if (!moneda && /^[a-z]{3}$/.test(t)) {
-      moneda = t.toUpperCase();
-      continue;
-    }
+    if (monto === null && /^-?\d+(\.\d+)?$/.test(t)) { monto = parseFloat(t); continue; }
+    if (!moneda && /^[a-z]{3}$/.test(t)) { moneda = t.toUpperCase(); continue; }
     lugarTokens.push(t);
   }
-
   return {
     raw,
     lugar: lugarTokens.join(" ").trim() || null,
@@ -75,75 +65,73 @@ function parseMessage(text) {
     moneda: (moneda || DEFAULT_CURRENCY).toUpperCase(),
   };
 }
+const quincena = d => (d.getDate() <= 15 ? 1 : 2);
 
-function quincena(date) {
-  return date.getDate() <= 15 ? 1 : 2;
-}
+// ---------------- Rutas ----------------
+// Ping
+app.get("/", (_req, res) => res.status(200).send("OK - wa-gastos (Meta)"));
 
-async function replyWhatsApp(to, body) {
-  // twilio exige prefijo whatsapp:
-  return client.messages.create({
-    from: `whatsapp:${TWILIO_NUMBER}`,
-    to, // ya viene con "whatsapp:+507..." desde Twilio en req.body.From
-    body
-  });
-}
-
-/* -------------------------------- Endpoints ------------------------------- */
-// Salud/diagnóstico
-app.get("/", (_req, res) => res.status(200).send("OK - wa-gastos-bot"));
-app.post("/status", (req, res) => {
-  // Si configuras Status Callback, Twilio pegará aquí eventos de entrega/lectura
-  console.log("Status callback:", req.body);
-  res.sendStatus(200);
+// Webhook verification (GET) - requerido por Meta
+app.get("/webhook", (req, res) => {
+  const mode = req.query["hub.mode"];
+  const token = req.query["hub.verify_token"];
+  const challenge = req.query["hub.challenge"];
+  if (mode === "subscribe" && token === VERIFY_TOKEN) return res.status(200).send(challenge);
+  return res.sendStatus(403);
 });
 
-// Webhook de Twilio (WhatsApp Sandbox -> tu servidor)
+// Webhook (POST) - mensajes entrantes de WhatsApp Cloud API
 app.post("/webhook", async (req, res) => {
   try {
-    const from = req.body.From;   // ej: "whatsapp:+5076XXXXXXX"
-    const body = req.body.Body;   // texto del mensaje
+    // Estructura: entry[0].changes[0].value.messages[0]
+    const entry = req.body.entry?.[0];
+    const change = entry?.changes?.[0];
+    const value = change?.value;
+    const msg = value?.messages?.[0];
 
-    if (!from) {
-      return res.sendStatus(200); // nada que procesar
-    }
+    if (!msg) return res.sendStatus(200); // no-message events
 
-    // Parseo del mensaje
-    const parsed = parseMessage(body);
-    if (!parsed.lugar || parsed.monto === null) {
-      await replyWhatsApp(from, "Formato inválido. Usa: 'lugar monto' (ej: super 23.50). Moneda opcional: '5 USD'.");
+    const fromWaId = msg.from;           // "5076...." (sin +, sin 'whatsapp:')
+    const text = msg.text?.body?.trim(); // mensaje
+
+    // Si envían botón/interactive, no tiene text; puedes manejarlo luego
+    if (!text) {
+      await sendWhatsAppText(fromWaId, "Envíame el gasto como: 'lugar monto' (ej: super 23.50 USD)");
       return res.sendStatus(200);
     }
 
-    // Fecha automática (servidor)
+    const parsed = parseMessage(text);
+    if (!parsed.lugar || parsed.monto === null) {
+      await sendWhatsAppText(fromWaId, "Formato inválido. Usa: 'lugar monto' (ej: farmacia 12,30). Moneda opcional: '5 USD'.");
+      return res.sendStatus(200);
+    }
+
     const now = new Date();
-    const gasto = {
+    await db.collection("gastos").add({
       fechaServidor: admin.firestore.Timestamp.fromDate(now),
       lugar: parsed.lugar,
       monto: parsed.monto,
       moneda: parsed.moneda,
-      userWaId: from, // número del remitente con prefijo whatsapp:
+      userWaId: fromWaId,
       raw: parsed.raw,
-      fuente: "whatsapp-twilio",
+      fuente: "whatsapp-cloud",
       year: now.getFullYear(),
       mes: now.getMonth() + 1,
       dia: now.getDate(),
       quincena: quincena(now),
-      createdAt: admin.firestore.FieldValue.serverTimestamp(),
-    };
-
-    await db.collection("gastos").add(gasto);
+      createdAt: admin.firestore.FieldValue.serverTimestamp()
+    });
 
     const montoFmt = parsed.monto.toLocaleString("es-PA", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-    await replyWhatsApp(from, `✅ Guardado: ${parsed.lugar} – ${montoFmt} ${parsed.moneda}`);
+    await sendWhatsAppText(fromWaId, `✅ Guardado: ${parsed.lugar} – ${montoFmt} ${parsed.moneda}`);
 
-    res.sendStatus(200);
-  } catch (err) {
-    console.error("Error en /webhook:", err);
-    res.sendStatus(500);
+    return res.sendStatus(200);
+  } catch (e) {
+    console.error("Webhook error:", e);
+    return res.sendStatus(200); // 200 para que Meta no reintente en bucle
   }
 });
 
-/* --------------------------------- Server --------------------------------- */
+// -------------- Server --------------
 const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => console.log(`WA Gastos (Twilio) escuchando en :${PORT}`));
+app.listen(PORT, () => console.log("WA Gastos (Meta) escuchando en :", PORT));
